@@ -93,8 +93,8 @@ pub use crate::args::{Arguments, ColorSetting, FormatSetting};
 /// the trial is considered "failed". If you need the behavior of
 /// `#[should_panic]` you need to catch the panic yourself. You likely want to
 /// compare the panic payload to an expected value anyway.
-pub struct Trial<Context> {
-    runner: Box<dyn FnOnce(bool, Arc<Context>) -> Outcome + Send>,
+pub struct Trial {
+    runner: Box<dyn FnOnce(bool) -> Outcome + Send>,
     info: TestInfo,
 }
 
@@ -185,7 +185,7 @@ impl<R, Fut, Context, TR: Into<TestResult>> AsyncContextRunner<Context> for R wh
 }
 
 
-impl<Context> Trial<Context> {
+impl Trial {
     /// Creates a (non-benchmark) test with the given name and runner.
     ///
     /// The runner returning `Ok(())` is interpreted as the test passing. If the
@@ -194,7 +194,7 @@ impl<Context> Trial<Context> {
     where R: Runner + Send + 'static,
     {
         Self {
-            runner: Box::new(move |_test_mode, _| match runner.run() {
+            runner: Box::new(move |_test_mode| match runner.run() {
                 Ok(()) => Outcome::Passed,
                 Err(failed) => Outcome::Failed(failed),
             }),
@@ -211,7 +211,7 @@ impl<Context> Trial<Context> {
     where R: AsyncRunner + Send + 'static,
     {
         Self {
-            runner: Box::new(move |_test_mode, _| match runner.run() {
+            runner: Box::new(move |_test_mode| match runner.run() {
                 Ok(()) => Outcome::Passed,
                 Err(failed) => Outcome::Failed(failed),
             }),
@@ -224,13 +224,13 @@ impl<Context> Trial<Context> {
         }
     }
 
-    pub fn test_async_in_context<R>(name: impl Into<String>, runner: R) -> Self
+    pub fn test_async_in_context<R, Context>(name: impl Into<String>, context: Arc<Context>, runner: R) -> Self
     where
         R: AsyncContextRunner<Context> + Send + 'static,
-        Context: Send + Sync,
+        Context: Send + Sync + 'static,
     {
         Self {
-            runner: Box::new(move |_test_mode, context| match runner.run(context) {
+            runner: Box::new(move |_test_mode| match runner.run(context) {
                 Ok(()) => Outcome::Passed,
                 Err(failed) => Outcome::Failed(failed),
             }),
@@ -260,7 +260,7 @@ impl<Context> Trial<Context> {
         R: FnOnce(bool) -> Result<Option<Measurement>, Failed> + Send + 'static,
     {
         Self {
-            runner: Box::new(move |test_mode, _| match runner(test_mode) {
+            runner: Box::new(move |test_mode| match runner(test_mode) {
                 Err(failed) => Outcome::Failed(failed),
                 Ok(_) if test_mode => Outcome::Passed,
                 Ok(Some(measurement)) => Outcome::Measured(measurement),
@@ -334,7 +334,7 @@ impl<Context> Trial<Context> {
     }
 }
 
-impl<Context> fmt::Debug for Trial<Context> {
+impl fmt::Debug for Trial {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         struct OpaqueRunner;
         impl fmt::Debug for OpaqueRunner {
@@ -488,13 +488,13 @@ impl Conclusion {
 
 impl Arguments {
     /// Returns `true` if the given test should be ignored.
-    fn is_ignored<Context>(&self, test: &Trial<Context>) -> bool {
+    fn is_ignored(&self, test: &Trial) -> bool {
         (test.info.is_ignored && !self.ignored && !self.include_ignored)
             || (test.info.is_bench && self.test)
             || (!test.info.is_bench && self.bench)
     }
 
-    fn is_filtered_out<Context>(&self, test: &Trial<Context>) -> bool {
+    fn is_filtered_out(&self, test: &Trial) -> bool {
         let test_name = test.name();
         // Match against the full test name, including the kind. This upholds the invariant that if
         // --list prints out:
@@ -546,7 +546,7 @@ impl Arguments {
 /// The returned value contains a couple of useful information. See
 /// [`Conclusion`] for more information. If `--list` was specified, a list is
 /// printed and a dummy `Conclusion` is returned.
-pub fn run<Context: Send + Sync + 'static>(args: &Arguments, context: Arc<Context>, mut tests: Vec<Trial<Context>>) -> Conclusion {
+pub fn run(args: &Arguments, mut tests: Vec<Trial>) -> Conclusion {
     let start_instant = Instant::now();
     let mut conclusion = Conclusion::empty();
 
@@ -597,7 +597,7 @@ pub fn run<Context: Send + Sync + 'static>(args: &Arguments, context: Arc<Contex
             let outcome = if args.is_ignored(&test) {
                 Outcome::Ignored
             } else {
-                run_single(test.runner, context.clone(), test_mode)
+                run_single(test.runner, test_mode)
             };
             handle_outcome(outcome, test.info, &mut printer);
         }
@@ -615,12 +615,11 @@ pub fn run<Context: Send + Sync + 'static>(args: &Arguments, context: Arc<Contex
                 sender.send((Outcome::Ignored, test.info)).unwrap();
             } else {
                 let sender = sender.clone();
-                let context = context.clone();
-                    pool.execute(move || {
+                pool.execute(move || {
                     // It's fine to ignore the result of sending. If the
                     // receiver has hung up, everything will wind down soon
                     // anyway.
-                    let outcome = run_single(test.runner, context, test_mode);
+                    let outcome = run_single(test.runner, test_mode);
                     let _ = sender.send((outcome, test.info));
                 });
             }
@@ -646,10 +645,10 @@ pub fn run<Context: Send + Sync + 'static>(args: &Arguments, context: Arc<Contex
 }
 
 /// Runs the given runner, catching any panics and treating them as a failed test.
-fn run_single<Context>(runner: Box<dyn FnOnce(bool, Arc<Context>) -> Outcome + Send>, c: Arc<Context>, test_mode: bool) -> Outcome {
+fn run_single(runner: Box<dyn FnOnce(bool) -> Outcome + Send>, test_mode: bool) -> Outcome {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
-    catch_unwind(AssertUnwindSafe(move || runner(test_mode, c))).unwrap_or_else(|e| {
+    catch_unwind(AssertUnwindSafe(move || runner(test_mode))).unwrap_or_else(|e| {
         // The `panic` information is just an `Any` object representing the
         // value the panic was invoked with. For most panics (which use
         // `panic!` like `println!`), this is either `&str` or `String`.

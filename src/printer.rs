@@ -25,7 +25,7 @@ pub(crate) struct Printer {
 impl Printer {
     /// Creates a new printer configured by the given arguments (`format`,
     /// `quiet`, `color` and `logfile` options).
-    pub(crate) fn new<Context>(args: &Arguments, tests: &[Trial<Context>]) -> Self {
+    pub(crate) fn new(args: &Arguments, tests: &[Trial]) -> Self {
         let color_arg = args.color.unwrap_or(ColorSetting::Auto);
 
         // Determine target of all output
@@ -248,12 +248,12 @@ impl Printer {
     }
 
     /// Prints a list of all tests. Used if `--list` is set.
-    pub(crate) fn print_list<Context>(&mut self, tests: &[Trial<Context>], ignored: bool) {
+    pub(crate) fn print_list(&mut self, tests: &[Trial], ignored: bool) {
         Self::write_list(tests, ignored, &mut self.out).unwrap();
     }
 
-    pub(crate) fn write_list<Context>(
-        tests: &[Trial<Context>],
+    pub(crate) fn write_list(
+        tests: &[Trial],
         ignored: bool,
         mut out: impl std::io::Write,
     ) -> std::io::Result<()> {
