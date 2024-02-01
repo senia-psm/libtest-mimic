@@ -69,9 +69,8 @@
 //!
 //! [capture]: https://github.com/LukasKalbertodt/libtest-mimic/issues/9
 
-#![forbid(unsafe_code)]
-
 use std::{process, sync::mpsc, fmt, time::Instant, borrow::Cow};
+use std::sync::Arc;
 
 mod args;
 mod printer;
@@ -94,22 +93,144 @@ pub use crate::args::{Arguments, ColorSetting, FormatSetting};
 /// the trial is considered "failed". If you need the behavior of
 /// `#[should_panic]` you need to catch the panic yourself. You likely want to
 /// compare the panic payload to an expected value anyway.
-pub struct Trial {
-    runner: Box<dyn FnOnce(bool) -> Outcome + Send>,
+pub struct Trial<Context> {
+    runner: Box<dyn FnOnce(bool, Arc<Context>) -> Outcome + Send>,
     info: TestInfo,
 }
 
-impl Trial {
+pub struct TestResult{
+    result: Result<(), Failed>
+}
+
+impl Into<TestResult> for Result<(), Failed> {
+    fn into(self) -> TestResult {
+        TestResult{result: self}
+    }
+}
+
+impl Into<TestResult> for () {
+    fn into(self) -> TestResult {
+        TestResult {result: Ok(())}
+    }
+}
+
+pub trait Runner {
+    fn run(self) -> Result<(), Failed>;
+}
+
+impl<R, TR: Into<TestResult>> Runner for R where R: FnOnce() -> TR {
+    fn run(self) -> Result<(), Failed> {
+        self().into().result
+    }
+}
+
+pub trait AsyncRunner {
+    fn run(self) -> Result<(), Failed>;
+}
+
+impl<R, Fut, TR: Into<TestResult>> AsyncRunner for R where R: FnOnce() -> Fut, Fut: ::core::future::Future<Output = TR> {
+    fn run(self) -> Result<(), Failed> {
+        let body = async {
+            self().await.into().result
+        };
+
+        let mut body = body;
+
+        #[allow(unused_mut)]
+        let mut body = unsafe {
+            tokio::macros::support::Pin::new_unchecked(&mut body)
+        };
+
+        let body: ::core::pin::Pin<&mut dyn ::core::future::Future<Output = Result<(), Failed>>> = body;
+
+        #[allow(clippy::expect_used, clippy::diverging_sub_expression)]
+        {
+            return tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed building the Runtime")
+                .block_on(body);
+        }
+    }
+}
+
+pub trait AsyncContextRunner<Context> {
+    fn run(self, c: Arc<Context>) -> Result<(), Failed>;
+}
+
+impl<R, Fut, Context, TR: Into<TestResult>> AsyncContextRunner<Context> for R where R: FnOnce(Arc<Context>) -> Fut, Fut: ::core::future::Future<Output = TR> {
+    fn run(self, c: Arc<Context>) -> Result<(), Failed> {
+        let body = async {
+            self(c).await.into().result
+        };
+
+        let mut body = body;
+
+        #[allow(unused_mut)]
+            let mut body = unsafe {
+            tokio::macros::support::Pin::new_unchecked(&mut body)
+        };
+
+        let body: ::core::pin::Pin<&mut dyn ::core::future::Future<Output = Result<(), Failed>>> = body;
+
+        #[allow(clippy::expect_used, clippy::diverging_sub_expression)]
+        {
+            return tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed building the Runtime")
+                .block_on(body);
+        }
+    }
+}
+
+
+impl<Context> Trial<Context> {
     /// Creates a (non-benchmark) test with the given name and runner.
     ///
     /// The runner returning `Ok(())` is interpreted as the test passing. If the
     /// runner returns `Err(_)`, the test is considered failed.
     pub fn test<R>(name: impl Into<String>, runner: R) -> Self
-    where
-        R: FnOnce() -> Result<(), Failed> + Send + 'static,
+    where R: Runner + Send + 'static,
     {
         Self {
-            runner: Box::new(move |_test_mode| match runner() {
+            runner: Box::new(move |_test_mode, _| match runner.run() {
+                Ok(()) => Outcome::Passed,
+                Err(failed) => Outcome::Failed(failed),
+            }),
+            info: TestInfo {
+                name: name.into(),
+                kind: String::new(),
+                is_ignored: false,
+                is_bench: false,
+            },
+        }
+    }
+
+    pub fn test_async<R>(name: impl Into<String>, runner: R) -> Self
+    where R: AsyncRunner + Send + 'static,
+    {
+        Self {
+            runner: Box::new(move |_test_mode, _| match runner.run() {
+                Ok(()) => Outcome::Passed,
+                Err(failed) => Outcome::Failed(failed),
+            }),
+            info: TestInfo {
+                name: name.into(),
+                kind: String::new(),
+                is_ignored: false,
+                is_bench: false,
+            },
+        }
+    }
+
+    pub fn test_async_in_context<R>(name: impl Into<String>, runner: R) -> Self
+    where
+        R: AsyncContextRunner<Context> + Send + 'static,
+        Context: Send + Sync,
+    {
+        Self {
+            runner: Box::new(move |_test_mode, context| match runner.run(context) {
                 Ok(()) => Outcome::Passed,
                 Err(failed) => Outcome::Failed(failed),
             }),
@@ -139,7 +260,7 @@ impl Trial {
         R: FnOnce(bool) -> Result<Option<Measurement>, Failed> + Send + 'static,
     {
         Self {
-            runner: Box::new(move |test_mode| match runner(test_mode) {
+            runner: Box::new(move |test_mode, _| match runner(test_mode) {
                 Err(failed) => Outcome::Failed(failed),
                 Ok(_) if test_mode => Outcome::Passed,
                 Ok(Some(measurement)) => Outcome::Measured(measurement),
@@ -213,7 +334,7 @@ impl Trial {
     }
 }
 
-impl fmt::Debug for Trial {
+impl<Context> fmt::Debug for Trial<Context> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         struct OpaqueRunner;
         impl fmt::Debug for OpaqueRunner {
@@ -367,13 +488,13 @@ impl Conclusion {
 
 impl Arguments {
     /// Returns `true` if the given test should be ignored.
-    fn is_ignored(&self, test: &Trial) -> bool {
+    fn is_ignored<Context>(&self, test: &Trial<Context>) -> bool {
         (test.info.is_ignored && !self.ignored && !self.include_ignored)
             || (test.info.is_bench && self.test)
             || (!test.info.is_bench && self.bench)
     }
 
-    fn is_filtered_out(&self, test: &Trial) -> bool {
+    fn is_filtered_out<Context>(&self, test: &Trial<Context>) -> bool {
         let test_name = test.name();
         // Match against the full test name, including the kind. This upholds the invariant that if
         // --list prints out:
@@ -425,7 +546,7 @@ impl Arguments {
 /// The returned value contains a couple of useful information. See
 /// [`Conclusion`] for more information. If `--list` was specified, a list is
 /// printed and a dummy `Conclusion` is returned.
-pub fn run(args: &Arguments, mut tests: Vec<Trial>) -> Conclusion {
+pub fn run<Context: Send + Sync + 'static>(args: &Arguments, context: Arc<Context>, mut tests: Vec<Trial<Context>>) -> Conclusion {
     let start_instant = Instant::now();
     let mut conclusion = Conclusion::empty();
 
@@ -476,7 +597,7 @@ pub fn run(args: &Arguments, mut tests: Vec<Trial>) -> Conclusion {
             let outcome = if args.is_ignored(&test) {
                 Outcome::Ignored
             } else {
-                run_single(test.runner, test_mode)
+                run_single(test.runner, context.clone(), test_mode)
             };
             handle_outcome(outcome, test.info, &mut printer);
         }
@@ -494,11 +615,12 @@ pub fn run(args: &Arguments, mut tests: Vec<Trial>) -> Conclusion {
                 sender.send((Outcome::Ignored, test.info)).unwrap();
             } else {
                 let sender = sender.clone();
-                pool.execute(move || {
+                let context = context.clone();
+                    pool.execute(move || {
                     // It's fine to ignore the result of sending. If the
                     // receiver has hung up, everything will wind down soon
                     // anyway.
-                    let outcome = run_single(test.runner, test_mode);
+                    let outcome = run_single(test.runner, context, test_mode);
                     let _ = sender.send((outcome, test.info));
                 });
             }
@@ -524,10 +646,10 @@ pub fn run(args: &Arguments, mut tests: Vec<Trial>) -> Conclusion {
 }
 
 /// Runs the given runner, catching any panics and treating them as a failed test.
-fn run_single(runner: Box<dyn FnOnce(bool) -> Outcome + Send>, test_mode: bool) -> Outcome {
+fn run_single<Context>(runner: Box<dyn FnOnce(bool, Arc<Context>) -> Outcome + Send>, c: Arc<Context>, test_mode: bool) -> Outcome {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
-    catch_unwind(AssertUnwindSafe(move || runner(test_mode))).unwrap_or_else(|e| {
+    catch_unwind(AssertUnwindSafe(move || runner(test_mode, c))).unwrap_or_else(|e| {
         // The `panic` information is just an `Any` object representing the
         // value the panic was invoked with. For most panics (which use
         // `panic!` like `println!`), this is either `&str` or `String`.

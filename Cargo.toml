@@ -23,6 +23,7 @@ clap = { version = "4.0.8", features = ["derive"] }
 threadpool = "1.8.1"
 termcolor = "1.0.5"
 escape8259 = "0.5.2"
+tokio = { version = "1.35.1", features = ["full", "test-util"] }
 
 [dev-dependencies]
 fastrand = "1.8.0"
