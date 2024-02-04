@@ -124,6 +124,16 @@ impl<R, TR: Into<TestResult>> Runner for R where R: FnOnce() -> TR {
     }
 }
 
+pub trait ContextRunner<Context> {
+    fn run(self, c: Context) -> Result<(), Failed>;
+}
+
+impl<R, Context, TR: Into<TestResult>> ContextRunner<Context> for R where R: FnOnce(Context) -> TR {
+    fn run(self, c:Context) -> Result<(), Failed> {
+        self(c).into().result
+    }
+}
+
 pub trait AsyncRunner {
     fn run(self) -> Result<(), Failed>;
 }
@@ -195,6 +205,25 @@ impl Trial {
     {
         Self {
             runner: Box::new(move |_test_mode| match runner.run() {
+                Ok(()) => Outcome::Passed,
+                Err(failed) => Outcome::Failed(failed),
+            }),
+            info: TestInfo {
+                name: name.into(),
+                kind: String::new(),
+                is_ignored: false,
+                is_bench: false,
+            },
+        }
+    }
+
+    pub fn test_in_context<R, Context>(name: impl Into<String>, context: Context, runner: R) -> Self
+    where
+        R: ContextRunner<Context> + Send + 'static,
+        Context: Send + Sync + 'static,
+    {
+        Self {
+            runner: Box::new(move |_test_mode| match runner.run(context) {
                 Ok(()) => Outcome::Passed,
                 Err(failed) => Outcome::Failed(failed),
             }),
